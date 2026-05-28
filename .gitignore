@@ -1,5 +1,6 @@
 FE_models_actual/
 output/
+__pycache__/
 
 # Local-only working notes (specimen-specific or scratch)
 ST7_FORMAT_local.md

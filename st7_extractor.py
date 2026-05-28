@@ -5,9 +5,11 @@ Strand7 (.st7) extractor.
 Pulls the geometric mesh and the engineering metadata we have reverse-engineered
 out of a Strand7 model file and writes any combination of:
 
-    OBJ  surface skin (brick boundary + plates as separate "attachment" groups)
-    VTU  full solid volume mesh (every tetrahedron) for ParaView
-    TXT  human-readable summary of materials, load cases, freedom cases, paths
+    OBJ  surface skin (brick boundary + plates separated by group_id)
+    VTU  full solid volume mesh (every tetrahedron) for ParaView,
+         with per-cell `property_id` and `group_id` scalar arrays
+    TXT  human-readable summary using Strand7's own field names
+         (Modulus, Poisson, MemThick, BendThick, PlateShellProp, …)
 
 See ST7_FORMAT.md for the file-format notes this is based on.
 """
@@ -301,24 +303,31 @@ def _parse_properties(data, start):
         # The doubles block always starts with a double = 8.0
         # (`40 20 00 00 00 00 00 00` little-endian), preceded by a 2-byte flag
         # field (`0B 00` for the common case, `0B C0` when temperature data is
-        # also present). After the 8.0 marker the layout is:
-        #   double  8.0                                 ← thickness / scale
+        # also present). After the 8.0 marker the layout (per the Strand7 TXT
+        # export `PlateShellProp` / `BrickProp` records) is:
+        #   double  8.0                                 ← constant marker
         #   double  0.0                                 ← filler
-        #   (optional) double  ref_temperature ×2       ← only in some files
-        #   double  Young's modulus                     ← typically 2.0e4 (MPa)
-        #   double  Poisson ratio                       ← typically 0.3
-        # We find the 8.0 anchor, then scan forward for the first double in
-        # the plausible Young's-modulus range and assume Poisson immediately
-        # follows it.
+        #   (optional) double  ref_temperature ×2       ← only when 0B C0 flag
+        #   double  Modulus            (`Modulus`,  Young's modulus, MPa)
+        #   double  Poisson            (`Poisson`,  Poisson's ratio)
+        #   ... a few flag bytes ...
+        #   uint16  NumLayers          (`NumLayers`, plate only)
+        #   ... more flag bytes ...
+        #   double  MemThick           (`MemThick`,  membrane thickness)
+        #   double  BendThick          (`BendThick`, bending thickness)
+        # The two thickness doubles only exist for plate / beam properties;
+        # brick records stop after Poisson's ratio.
         anchor = b"\x40\x20\x00\x00\x00\x00\x00\x00"  # double 8.0 LE
         idx = data.find(anchor, cursor, cursor + 200)
+        num_layers = None
+        mem_thick = None
+        bend_thick = None
         if idx != -1:
             thickness_or_scale = 8.0
-            # Doubles after the anchor are NOT necessarily 8-byte aligned to it
-            # (the property record header is variable-length). Scan byte-by-byte
-            # for the first double that looks like a Young's modulus, then take
-            # the immediately-following double as Poisson's ratio.
             scan = idx + 8
+            # Modulus + Poisson — first double in plausible material-stiffness
+            # range, followed by a Poisson-like value.
+            young_off = None
             for o in range(scan, min(scan + 64, end - 16)):
                 d = _f64(data, o)
                 if math.isfinite(d) and 1.0e2 <= d <= 1.0e15:
@@ -326,7 +335,25 @@ def _parse_properties(data, start):
                     if math.isfinite(p) and -1.0 <= p <= 0.6:
                         young = d
                         poisson = p
+                        young_off = o
                         break
+            # For plate properties only: NumLayers, MemThick, BendThick.
+            # Empirically (verified across the sample files):
+            #   NumLayers (uint32) is at Poisson_end + 10
+            #   MemThick  (double) is at Poisson_end + 16
+            #   BendThick (double) is at Poisson_end + 24
+            if kind == 0x03 and young_off is not None:
+                post = young_off + 16  # past Young + Poisson doubles
+                if post + 32 <= end:
+                    nl = _u32(data, post + 10)
+                    if 1 <= nl <= 256:
+                        num_layers = nl
+                    t1 = _f64(data, post + 16)
+                    t2 = _f64(data, post + 24)
+                    if math.isfinite(t1) and 1.0e-12 <= t1 <= 1.0e6:
+                        mem_thick = t1
+                    if math.isfinite(t2) and 1.0e-12 <= t2 <= 1.0e6:
+                        bend_thick = t2
 
         kind_name = {0x04: "Brick", 0x03: "Plate", 0x02: "Beam"}[kind]
         props.append({
@@ -338,6 +365,9 @@ def _parse_properties(data, start):
             "thickness_or_scale": thickness_or_scale,
             "young_modulus": young,
             "poisson_ratio": poisson,
+            "num_layers": num_layers,
+            "mem_thick": mem_thick,
+            "bend_thick": bend_thick,
             "file_offset": i,
         })
         i = cursor + 1  # advance past the record we just parsed
@@ -535,21 +565,26 @@ def extract(path):
 # ---------------------------------------------------------------------------
 
 def write_obj(model, out_path):
-    """Write surface skin + plate attachment groups as a Wavefront OBJ."""
+    """Write surface skin + plate groups as a Wavefront OBJ.
+
+    Each plate element carries a `group_id` (the third integer in the
+    `Tri3` / `Quad4` rows of Strand7's TXT export). When the file uses
+    multiple groups for plates, this typically separates the bulk surface
+    from muscle / attachment patches modelled as overlay shells. We emit
+    one OBJ object per group so they can be selected independently.
+    """
     coords = model["coords"]
     plates = model["plates"]
     bricks = model["bricks"]
 
-    # Group plates by their `type` field (1..7) — these are the muscle
-    # attachment patches in this dataset.
-    plates_by_type = defaultdict(list)
-    for type_id, _prop, n, nodes in plates:
+    plates_by_group = defaultdict(list)
+    for group_id, _prop, n, nodes in plates:
         if n == 3:
-            plates_by_type[type_id].append(tuple(nodes))
+            plates_by_group[group_id].append(tuple(nodes))
         elif n == 4:
-            plates_by_type[type_id].append(tuple(nodes))
+            plates_by_group[group_id].append(tuple(nodes))
         elif n >= 6:
-            plates_by_type[type_id].append(tuple(nodes[:3]))
+            plates_by_group[group_id].append(tuple(nodes[:3]))
 
     skin = _build_brick_skin(bricks, coords)
 
@@ -557,20 +592,21 @@ def write_obj(model, out_path):
         f.write(f"# Extracted from {model['path'].name}\n")
         f.write(f"# Nodes: {model['header']['node_count']}\n")
         f.write(f"# Bricks: {len(bricks)}  Plates: {len(plates)}  "
-                f"Attachment groups: {len(plates_by_type)}\n")
+                f"Plate groups: {len(plates_by_group)}\n")
 
         for x, y, z in coords[1:]:
             f.write(f"v {x} {y} {z}\n")
 
         # Bone surface (skinned bricks) first
-        f.write("o Bone_Surface\n")
+        f.write("o Brick_Skin\n")
         for face in skin:
             f.write("f " + " ".join(str(n) for n in face) + "\n")
 
-        # Each plate type as its own selectable object
-        for type_id in sorted(plates_by_type):
-            f.write(f"o Attachment_{type_id}\n")
-            for face in plates_by_type[type_id]:
+        # One object per plate group_id (Group 1 is usually the bone-surface
+        # shell overlay; higher group IDs are attachment / loading patches).
+        for group_id in sorted(plates_by_group):
+            f.write(f"o Plate_Group_{group_id}\n")
+            for face in plates_by_group[group_id]:
                 f.write("f " + " ".join(str(n) for n in face) + "\n")
     return out_path
 
@@ -582,8 +618,10 @@ def write_vtu(model, out_path):
         VTK_TETRA   = 10  (4-node)
         VTK_QUADRATIC_TETRA = 24  (10-node, mid-side nodes preserved)
     Cell data arrays:
-        property_id : per-cell property index
-        type_id     : per-cell `type` field from the .st7
+        property_id : Strand7 property index (matches BrickProp / PlateShellProp)
+        group_id    : Strand7 group index    (matches the third column in the
+                                              `Tetra4` / `Tri3` rows of the
+                                              `.txt` export)
     """
     coords = model["coords"]
     bricks = model["bricks"]
@@ -595,9 +633,9 @@ def write_vtu(model, out_path):
     offsets = []
     types = []
     prop_ids = []
-    type_ids = []
+    group_ids = []
     running = 0
-    for type_id, prop_id, n, nodes in bricks:
+    for group_id, prop_id, n, nodes in bricks:
         if n == 4:
             ct = 10
             conn.extend(nid - 1 for nid in nodes)
@@ -612,7 +650,7 @@ def write_vtu(model, out_path):
         offsets.append(running)
         types.append(ct)
         prop_ids.append(prop_id)
-        type_ids.append(type_id)
+        group_ids.append(group_id)
 
     with open(out_path, 'w') as f:
         f.write('<?xml version="1.0"?>\n')
@@ -669,9 +707,9 @@ def write_vtu(model, out_path):
                 f.write("\n          ")
         f.write('\n        </DataArray>\n')
 
-        f.write('        <DataArray type="Int32" Name="type_id" '
+        f.write('        <DataArray type="Int32" Name="group_id" '
                 'format="ascii">\n          ')
-        for k, v in enumerate(type_ids):
+        for k, v in enumerate(group_ids):
             f.write(f"{v} ")
             if (k + 1) % 32 == 0:
                 f.write("\n          ")
@@ -685,16 +723,22 @@ def write_vtu(model, out_path):
 
 
 def write_txt(model, out_path):
-    """Write a human-readable summary of model + simulation parameters."""
+    """Write a human-readable summary of model + simulation parameters.
+
+    Field names follow Strand7's own text-export conventions
+    (Modulus, Poisson, MemThick, BendThick, NumLayers, PlGlobalLoad, …)
+    so the output reads side-by-side with a `.txt` produced by Strand7."""
     h = model["header"]
-    plates_by_type = defaultdict(int)
-    plates_by_prop = defaultdict(int)
-    for type_id, prop_id, _n, _nodes in model["plates"]:
-        plates_by_type[type_id] += 1
-        plates_by_prop[prop_id] += 1
-    bricks_by_prop = defaultdict(int)
-    for _t, prop_id, _n, _nodes in model["bricks"]:
-        bricks_by_prop[prop_id] += 1
+    plates_by_group = defaultdict(int)
+    plates_by_prop  = defaultdict(int)
+    for group_id, prop_id, _n, _nodes in model["plates"]:
+        plates_by_group[group_id] += 1
+        plates_by_prop[prop_id]   += 1
+    bricks_by_group = defaultdict(int)
+    bricks_by_prop  = defaultdict(int)
+    for group_id, prop_id, _n, _nodes in model["bricks"]:
+        bricks_by_group[group_id] += 1
+        bricks_by_prop[prop_id]   += 1
 
     loads = model["loads"]
     if loads:
@@ -709,62 +753,81 @@ def write_txt(model, out_path):
         f.write(f"Strand7 model summary — {model['path'].name}\n")
         f.write("=" * 60 + "\n\n")
         f.write("FILE\n")
-        f.write(f"  size              : {model['file_size']:,} bytes\n")
-        f.write(f"  magic             : {h['magic']!r}\n")
-        f.write(f"  Strand7 version   : {h['major']}.{h['minor']} (build {h['build']})\n")
-        f.write(f"  node block offset : 0x{model['node_offset']:X}\n")
-        f.write(f"  after-bricks      : 0x{model['after_bricks']:X}\n")
+        f.write(f"  size                  : {model['file_size']:,} bytes\n")
+        f.write(f"  magic                 : {h['magic']!r}\n")
+        f.write(f"  Strand7 version       : {h['major']}.{h['minor']} (build {h['build']})\n")
+        f.write(f"  node block offset     : 0x{model['node_offset']:X}\n")
+        f.write(f"  end of brick block    : 0x{model['after_bricks']:X}\n")
+        f.write("\nUNITS (Strand7 default — not stored in the binary header)\n")
+        f.write("  LengthUnit            : mm\n")
+        f.write("  MassUnit              : kg\n")
+        f.write("  ForceUnit             : N\n")
+        f.write("  PressureUnit / E      : MPa\n")
+        f.write("  TemperatureUnit       : C\n")
         f.write("\nMESH\n")
-        f.write(f"  nodes             : {h['node_count']:,}\n")
-        f.write(f"  plates (header)   : {h['plate_count']:,}\n")
-        f.write(f"  plates (parsed)   : {len(model['plates']):,}\n")
-        f.write(f"  bricks (header)   : {h['brick_count']:,}\n")
-        f.write(f"  bricks (parsed)   : {len(model['bricks']):,}")
+        f.write(f"  nodes                 : {h['node_count']:,}\n")
+        f.write(f"  plates  (header)      : {h['plate_count']:,}\n")
+        f.write(f"  plates  (parsed)      : {len(model['plates']):,}\n")
+        f.write(f"  bricks  (header)      : {h['brick_count']:,}\n")
+        f.write(f"  bricks  (parsed)      : {len(model['bricks']):,}")
         if model["brick_truncated_at"] is not None:
             f.write(f"   (truncated at idx {model['brick_truncated_at']} — "
                     f"header over-counts by {h['brick_count'] - len(model['bricks'])})")
         f.write("\n")
-        f.write(f"  plate types       : {dict(plates_by_type)}\n")
-        f.write(f"  plate prop_ids    : {dict(plates_by_prop)}\n")
-        f.write(f"  brick prop_ids    : {dict(bricks_by_prop)}\n")
+        f.write(f"  plates by group_id    : {dict(plates_by_group)}\n")
+        f.write(f"  plates by prop_id     : {dict(plates_by_prop)}\n")
+        f.write(f"  bricks by group_id    : {dict(bricks_by_group)}\n")
+        f.write(f"  bricks by prop_id     : {dict(bricks_by_prop)}\n")
 
-        f.write("\nMATERIALS / PROPERTIES\n")
+        f.write("\nPROPERTIES (Strand7 PlateShellProp / BrickProp / BeamProp)\n")
         if not model["properties"]:
             f.write("  (none decoded)\n")
         for p in model["properties"]:
-            f.write(f"  - [{p['kind']}] {p['name']!r}\n")
-            f.write(f"      prop_id     = {p['prop_id']}\n")
-            f.write(f"      colour RGBA = {p['color_rgba']}\n")
-            f.write(f"      material    = {p['material']!r}\n")
-            if p['thickness_or_scale'] is not None:
-                f.write(f"      thickness/scale = {p['thickness_or_scale']:g}\n")
+            kind_tag = {"Brick": "BrickProp",
+                        "Plate": "PlateShellProp",
+                        "Beam":  "BeamProp"}.get(p['kind'], p['kind'])
+            f.write(f"  - {kind_tag}  {p['prop_id']}   {p['name']!r}\n")
+            f.write(f"      MaterialName      : {p['material']!r}\n")
+            f.write(f"      ColorRGBA         : {p['color_rgba']}\n")
             if p['young_modulus'] is not None:
-                f.write(f"      Young's E   = {p['young_modulus']:g}\n")
+                f.write(f"      Modulus           : {p['young_modulus']:g}        (MPa, Young's E)\n")
             if p['poisson_ratio'] is not None:
-                f.write(f"      Poisson ν   = {p['poisson_ratio']:g}\n")
+                f.write(f"      Poisson           : {p['poisson_ratio']:g}\n")
+            if p.get('mem_thick') is not None:
+                f.write(f"      MemThick          : {p['mem_thick']:g}\n")
+            if p.get('bend_thick') is not None:
+                f.write(f"      BendThick         : {p['bend_thick']:g}\n")
+            if p.get('num_layers') is not None:
+                f.write(f"      NumLayers         : {p['num_layers']}\n")
 
-        f.write("\nLOAD CASE (nodal forces)\n")
-        f.write(f"  records           : {len(loads):,}\n")
+        f.write("\nLOAD CASE  (per-record force vectors — binary marker 42 01 07 03)\n")
+        f.write(f"  records               : {len(loads):,}\n")
         if loads:
-            f.write(f"  sum F             : ({sx:.4e}, {sy:.4e}, {sz:.4e}) N\n")
-            f.write(f"  |sum F|           : {smag:.4e} N\n")
-            f.write(f"  first 5           :\n")
+            f.write(f"  sum F                 : ({sx:.4e}, {sy:.4e}, {sz:.4e}) N\n")
+            f.write(f"  |sum F|               : {smag:.4e} N\n")
+            f.write(f"  first 5 records       :\n")
             for nid, fx, fy, fz in loads[:5]:
-                f.write(f"     node {nid:6d}  F=({fx:+.4e}, {fy:+.4e}, {fz:+.4e})\n")
+                f.write(f"     id {nid:6d}  F=({fx:+.4e}, {fy:+.4e}, {fz:+.4e})\n")
+        f.write("  (Strand7's TXT export labels these PlGlobalLoad — they are\n")
+        f.write("   plate-face global loads, applied per plate element.)\n")
 
-        f.write("\nNAMED GROUPS / LOAD-CASE LABELS\n")
+        f.write("\nFREEDOM CASES / GROUP NAMES (label strings recovered from tail)\n")
         if not model["group_names"]:
-            f.write("  (none decoded — file may use a single anonymous case)\n")
+            f.write("  (none decoded — file may have a single anonymous case)\n")
         for g in model["group_names"]:
             f.write(f"  - {g}\n")
 
-        f.write("\nSOURCE TITLES\n")
+        f.write("\nMODEL TITLE\n")
         for t in model["titles"]:
             f.write(f"  - {t}\n")
+        if not model["titles"]:
+            f.write("  (none)\n")
 
         f.write("\nRESULT-FILE REFERENCES (paths embedded by Strand7)\n")
         for p in model["paths"]:
             f.write(f"  - {p}\n")
+        if not model["paths"]:
+            f.write("  (none)\n")
     return out_path
 
 
